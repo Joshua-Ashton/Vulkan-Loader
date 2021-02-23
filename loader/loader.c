@@ -7082,6 +7082,31 @@ struct LoaderSortedPhysicalDevice {
     struct loader_icd_term* icd_term;
 };
 
+int PhysicalDeviceOrdering(VkPhysicalDeviceType type)
+{
+    switch (type) {
+        default:
+        case VK_PHYSICAL_DEVICE_TYPE_OTHER:          return 3;
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return 2;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 1;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 0;
+    }
+}
+
+int ComparePhysicalDeviceTypes(const void *a, const void *b)
+{
+    const struct LoaderSortedPhysicalDevice *data_a = (const struct LoaderSortedPhysicalDevice *)a;
+    const struct LoaderSortedPhysicalDevice *data_b = (const struct LoaderSortedPhysicalDevice *)b;
+    VkPhysicalDeviceProperties prop_a, prop_b;
+    // The Linux code only stores 1 physical device in the structure,
+    // as an ICD can expose more than once physical device and we are sorting by type.
+    data_a->icd_term->dispatch.GetPhysicalDeviceProperties(data_a->physical_devices[0], &prop_a);
+    data_b->icd_term->dispatch.GetPhysicalDeviceProperties(data_b->physical_devices[0], &prop_b);
+
+    return PhysicalDeviceOrdering(prop_a.deviceType) - PhysicalDeviceOrdering(prop_b.deviceType);
+}
+
 // This function allocates an array in sorted_devices which must be freed by the caller if not null
 VkResult ReadSortedPhysicalDevices(struct loader_instance *inst, struct LoaderSortedPhysicalDevice **sorted_devices, uint32_t* sorted_count)
 {
@@ -7195,13 +7220,94 @@ VkResult ReadSortedPhysicalDevices(struct loader_instance *inst, struct LoaderSo
         dxgi_factory->lpVtbl->Release(dxgi_factory);
     }
 
-out:
+#else
+    struct loader_icd_term *icd_term;
+    *sorted_count = 0;
+
+    // Get the total number of physical devices we have.
+    icd_term = inst->icd_terms;
+    for (; NULL != icd_term; icd_term = icd_term->next) {
+        uint32_t count = 0;
+        VkResult vkres = icd_term->dispatch.EnumeratePhysicalDevices(icd_term->instance, &count, NULL);
+        if (vkres == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            continue; // This driver doesn't support the adapter
+        } else if (vkres == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        } else if (vkres != VK_SUCCESS) {
+            loader_log(inst, VK_DEBUG_REPORT_WARNING_BIT_EXT, 0, "Failed to enumerate physical devices for sorting.");
+            continue;
+        }
+        (*sorted_count) += count;
+    }
+
+    *sorted_devices = loader_instance_heap_alloc(inst, (*sorted_count) * sizeof(struct LoaderSortedPhysicalDevice), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+    if (*sorted_devices == NULL) {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto out;
+    }
+
+    // Loop through our ids, enumerating all our physical devices
+    // into the array to be sorted.
+    icd_term = inst->icd_terms;
+    uint32_t i = 0;
+    for (uint32_t icd_idx = 0; NULL != icd_term; icd_term = icd_term->next, icd_idx++) {
+        VkPhysicalDevice *phys_devs;
+        uint32_t count = 0;
+        VkResult vkres = icd_term->dispatch.EnumeratePhysicalDevices(icd_term->instance, &count, NULL);
+
+        if (vkres == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            continue; // This driver doesn't support the adapter
+        } else if (vkres == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        } else if (vkres != VK_SUCCESS) {
+            loader_log(inst, VK_DEBUG_REPORT_WARNING_BIT_EXT, 0, "Failed to enumerate physical devices for sorting.");
+            continue;
+        }
+
+        phys_devs = loader_instance_heap_alloc(inst, count * sizeof(VkPhysicalDevice), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+        if (phys_devs == NULL) {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto out;
+        }
+
+        vkres = icd_term->dispatch.EnumeratePhysicalDevices(icd_term->instance, &count, phys_devs);
+
+        if (vkres == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            loader_instance_heap_free(inst, phys_devs);
+            goto out;
+        } else if (vkres != VK_SUCCESS) {
+            loader_log(inst, VK_DEBUG_REPORT_WARNING_BIT_EXT, 0, "Failed to enumerate physical devices for sorting.");
+            loader_instance_heap_free(inst, phys_devs);
+            continue;
+        }
+
+        for (uint32_t phys_dev_idx = 0; phys_dev_idx < count; phys_dev_idx++) {
+            (*sorted_devices)[i].device_count = 1;
+            (*sorted_devices)[i].physical_devices = loader_instance_heap_alloc(inst, sizeof(VkPhysicalDevice), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+            (*sorted_devices)[i].physical_devices[0] = phys_devs[phys_dev_idx];
+            (*sorted_devices)[i].icd_index = icd_idx;
+            (*sorted_devices)[i].icd_term = icd_term;
+
+            i++;
+        }
+
+        loader_instance_heap_free(inst, phys_devs);
+    }
+
+    qsort(*sorted_devices, *sorted_count, sizeof(struct LoaderSortedPhysicalDevice), ComparePhysicalDeviceTypes);
 #endif
 
+out:
     if (*sorted_count == 0 && *sorted_devices != NULL) {
         loader_instance_heap_free(inst, *sorted_devices);
         *sorted_devices = NULL;
     }
+
+    inst->total_gpu_count = *sorted_count;
+
     return res;
 }
 
@@ -7247,6 +7353,10 @@ VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
         // and we successfully enumerated sorted adapters using ReadSortedPhysicalDevices.
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
         if (sorted_count && icd_term->scanned_icd->EnumerateAdapterPhysicalDevices != NULL) {
+            continue;
+        }
+#else
+        if (sorted_count) {
             continue;
         }
 #endif
@@ -7304,7 +7414,6 @@ VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
     // Copy or create everything to fill the new array of physical devices
     uint32_t idx = 0;
 
-#if defined(_WIN32)
     // Copy over everything found through sorted enumeration
     for (uint32_t i = 0; i < sorted_count; ++i) {
         for (uint32_t j = 0; j < sorted_phys_dev_array[i].device_count; ++j) {
@@ -7342,7 +7451,6 @@ VkResult setupLoaderTermPhysDevs(struct loader_instance *inst) {
             idx++;
         }
     }
-#endif
 
     // Copy over everything found through EnumeratePhysicalDevices
     for (uint32_t icd_idx = 0; icd_idx < inst->total_icd_count; icd_idx++) {
@@ -8006,7 +8114,7 @@ VkResult setupLoaderTermPhysDevGroups(struct loader_instance *inst) {
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
         bool icd_sorted = sorted_count && (icd_term->scanned_icd->EnumerateAdapterPhysicalDevices != NULL);
 #else
-        bool icd_sorted = false;
+        bool icd_sorted = sorted_count != 0;
 #endif
 
         // Get the function pointer to use to call into the ICD. This could be the core or KHR version
@@ -8084,7 +8192,6 @@ VkResult setupLoaderTermPhysDevGroups(struct loader_instance *inst) {
 
     uint32_t idx = 0;
 
-#if defined(_WIN32)
     // Copy over everything found through sorted enumeration
     for (uint32_t i = 0; i < sorted_count; ++i) {
 
@@ -8154,7 +8261,6 @@ VkResult setupLoaderTermPhysDevGroups(struct loader_instance *inst) {
 
         ++idx;
     }
-#endif
 
     // Copy or create everything to fill the new array of physical device groups
     for (uint32_t new_idx = 0; new_idx < total_count; new_idx++) {
